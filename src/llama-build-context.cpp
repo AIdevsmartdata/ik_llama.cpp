@@ -4495,9 +4495,21 @@ ggml_cgraph * llm_build_context::build_qwen3next() {
         lctx.inp_state_indices_qnext = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         cb(lctx.inp_state_indices_qnext, "inp_state_indices_qnext", -1);
         ggml_set_input(lctx.inp_state_indices_qnext);
-        lctx.inp_qnext_reset_mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_tokens);
-        cb(lctx.inp_qnext_reset_mask, "inp_qnext_reset_mask", -1);
-        ggml_set_input(lctx.inp_qnext_reset_mask);
+        // Only allocate inp_qnext_reset_mask if any token has pos==0; otherwise the
+        // batched core skips the multiply path so the tensor would never enter the graph
+        // topology and the backend scheduler would leave its buffer unallocated → SEGV
+        // in llama_set_inputs. Decoder steady-state (pos>0) avoids the alloc entirely.
+        bool reset_any_alloc = false;
+        if (batch.pos != nullptr) {
+            for (int64_t i = 0; i < batch.n_tokens; ++i) {
+                if (batch.pos[i] == 0) { reset_any_alloc = true; break; }
+            }
+        }
+        if (reset_any_alloc) {
+            lctx.inp_qnext_reset_mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_tokens);
+            cb(lctx.inp_qnext_reset_mask, "inp_qnext_reset_mask", -1);
+            ggml_set_input(lctx.inp_qnext_reset_mask);
+        }
     }
 
     float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
@@ -4591,9 +4603,21 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
         lctx.inp_state_indices_qnext = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         cb(lctx.inp_state_indices_qnext, "inp_state_indices_qnext", -1);
         ggml_set_input(lctx.inp_state_indices_qnext);
-        lctx.inp_qnext_reset_mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_tokens);
-        cb(lctx.inp_qnext_reset_mask, "inp_qnext_reset_mask", -1);
-        ggml_set_input(lctx.inp_qnext_reset_mask);
+        // Only allocate inp_qnext_reset_mask if any token has pos==0; otherwise the
+        // batched core skips the multiply path so the tensor would never enter the graph
+        // topology and the backend scheduler would leave its buffer unallocated → SEGV
+        // in llama_set_inputs. Decoder steady-state (pos>0) avoids the alloc entirely.
+        bool reset_any_alloc = false;
+        if (batch.pos != nullptr) {
+            for (int64_t i = 0; i < batch.n_tokens; ++i) {
+                if (batch.pos[i] == 0) { reset_any_alloc = true; break; }
+            }
+        }
+        if (reset_any_alloc) {
+            lctx.inp_qnext_reset_mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_tokens);
+            cb(lctx.inp_qnext_reset_mask, "inp_qnext_reset_mask", -1);
+            ggml_set_input(lctx.inp_qnext_reset_mask);
+        }
     }
 
     float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
@@ -4686,9 +4710,21 @@ ggml_cgraph * llm_build_context::build_qwen35() {
         lctx.inp_state_indices_qnext = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         cb(lctx.inp_state_indices_qnext, "inp_state_indices_qnext", -1);
         ggml_set_input(lctx.inp_state_indices_qnext);
-        lctx.inp_qnext_reset_mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_tokens);
-        cb(lctx.inp_qnext_reset_mask, "inp_qnext_reset_mask", -1);
-        ggml_set_input(lctx.inp_qnext_reset_mask);
+        // Only allocate inp_qnext_reset_mask if any token has pos==0; otherwise the
+        // batched core skips the multiply path so the tensor would never enter the graph
+        // topology and the backend scheduler would leave its buffer unallocated → SEGV
+        // in llama_set_inputs. Decoder steady-state (pos>0) avoids the alloc entirely.
+        bool reset_any_alloc = false;
+        if (batch.pos != nullptr) {
+            for (int64_t i = 0; i < batch.n_tokens; ++i) {
+                if (batch.pos[i] == 0) { reset_any_alloc = true; break; }
+            }
+        }
+        if (reset_any_alloc) {
+            lctx.inp_qnext_reset_mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_tokens);
+            cb(lctx.inp_qnext_reset_mask, "inp_qnext_reset_mask", -1);
+            ggml_set_input(lctx.inp_qnext_reset_mask);
+        }
     }
 
     float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;

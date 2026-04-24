@@ -774,13 +774,16 @@ ggml_tensor * delta_net::build_layer_attn_linear_core_batched(ggml_context * ctx
     state_gathered = ggml_reshape_2d(ctx0, state_gathered, state_dim, n_seqs);
 
     // Reset-mask application. Skip entirely if no seq in this tick has pos==0 (decode steady state).
+    // The matching allocation gate in build_qwen3next/35moe/35 only allocates inp_qnext_reset_mask
+    // when reset_any is true; otherwise lctx.inp_qnext_reset_mask remains nullptr here so we
+    // must not dereference it.
     bool reset_any = false;
     if (batch.pos != nullptr) {
         for (int64_t i = 0; i < batch.n_tokens; ++i) {
             if (batch.pos[i] == 0) { reset_any = true; break; }
         }
     }
-    if (reset_any) {
+    if (reset_any && lctx.inp_qnext_reset_mask != nullptr) {
         // Multiply state_gathered [state_dim, n_seqs] by reset_mask broadcast [1, n_seqs].
         // ggml_mul broadcasts when one operand has ne[0]==1.
         ggml_tensor * mask_2d = ggml_reshape_2d(ctx0, lctx.inp_qnext_reset_mask, 1, n_seqs);
