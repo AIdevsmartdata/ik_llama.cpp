@@ -519,10 +519,17 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
         // Fast path for multi-sequence decode-like batches:
         // one token per unique sequence, no copy-to-multiple-sequences routing.
-        ggml_cuda_pool_alloc<int32_t> seq_ids(ctx.pool(), n_t);
-        ggml_cuda_pool_alloc<int32_t> seq_seen(ctx.pool(), n_kv);
+        //
+        // IMPORTANT: fast_path_ok_d is declared at function scope (line 464) so its
+        // RAII destructor runs LATER than seq_ids/seq_seen (declared in this inner
+        // block). The CUDA VMM pool requires strictly LIFO free order, so we MUST
+        // allocate fast_path_ok_d BEFORE seq_ids and seq_seen — otherwise the inner
+        // block's exit frees seq_seen (offset N) before fast_path_ok_d (offset N+1)
+        // and the pool LIFO assert fires (ggml-cuda.cu:493).
         int32_t fast_path_ok = 1;
         fast_path_ok_d.alloc(1);
+        ggml_cuda_pool_alloc<int32_t> seq_ids(ctx.pool(), n_t);
+        ggml_cuda_pool_alloc<int32_t> seq_seen(ctx.pool(), n_kv);
 
         CUDA_CHECK(cudaMemsetAsync(seq_seen.get(), 0, n_kv * sizeof(int32_t), ctx.stream()));
         CUDA_CHECK(cudaMemcpyAsync(fast_path_ok_d.get(), &fast_path_ok, sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));

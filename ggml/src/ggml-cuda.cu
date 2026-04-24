@@ -490,6 +490,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         pool_used -= size;
 
         // all deallocations must be in reverse order of the allocations
+        if (ptr != (void *) (pool_addr + pool_used)) {
+            fprintf(stderr, "[CUDA POOL DEBUG] LIFO violation: ptr=%p expected=%p size=%zu pool_used=%zu pool_addr=%p diff=%lld\n",
+                    ptr, (void *) (pool_addr + pool_used), size, pool_used, (void *) pool_addr,
+                    (long long) ((char *) ptr - (char *) (pool_addr + pool_used)));
+            fflush(stderr);
+        }
         GGML_ASSERT(ptr == (void *) (pool_addr + pool_used));
     }
 };
