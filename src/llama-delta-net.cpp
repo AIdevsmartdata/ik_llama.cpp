@@ -876,6 +876,13 @@ ggml_tensor * delta_net::build_layer_attn_linear_core_batched(ggml_context * ctx
     ggml_tensor * new_conv_flat = ggml_reshape_2d(ctx0, new_conv_states_cont, conv_state_dim, n_seqs);
     ggml_tensor * new_ssm_flat  = ggml_reshape_2d(ctx0, new_ssm_state, ssm_state_dim, n_seqs);
     ggml_tensor * new_state_flat = ggml_concat(ctx0, new_conv_flat, new_ssm_flat, 0);
+    // ggml_set_rows requires its `b` argument to be contiguous in the row direction
+    // (see ggml_is_contiguous_rows assert + CUDA pool LIFO assumption). The concat above
+    // produces a contiguous-looking tensor but its CUDA op holds intermediate pool memory
+    // that conflicts with set_rows' own pool allocation order, causing the LIFO assert
+    // (ggml-cuda.cu:493) to fire. Materializing a fresh contiguous copy via ggml_cont
+    // forces the concat output through a stable CUDA buffer and unblocks set_rows.
+    new_state_flat = ggml_cont(ctx0, new_state_flat);
     cb(new_state_flat, "batched_new_state_flat", il);
 
     // ggml_set_rows expects:
