@@ -738,10 +738,13 @@ ggml_tensor * delta_net::build_layer_attn_linear_core_batched(ggml_context * ctx
     // qkvz projections (matmul is column-agnostic — batch-capable).
     auto [qkv_mixed, z] = build_qkvz(lctx, ctx0, model.layers[il].wqkv, model.layers[il].wqkv_gate, model.layers[il].ssm_in,
             head_k_dim, num_k_heads, head_v_dim, num_v_heads, normed, il, cb, gf);
-    // build_qkvz reshapes qkv_mixed to [qkv_dim, n_tok, 1]. For batched we want [qkv_dim, 1, n_seqs].
-    // Swap via a reshape_3d (zero-cost view op).
-    qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
-    cb(qkv_mixed, "batched_qkv_mixed", il);
+    // build_qkvz returns qkv_mixed shaped [qkv_dim, n_tok=n_seq_tokens*n_seqs, 1] (3D with ne[2]=1,
+    // i.e. a matrix semantically). ggml_ssm_conv requires ggml_is_matrix(x) (ne[2]==1 && ne[3]==1),
+    // so we must NOT promote ne[2] to n_seqs. The kv-slot fan-out is encoded by the sq input
+    // (inp_s_seq_qnext = identity mapping [n_seqs, n_seqs] I32), not by x's shape. Collapse to a
+    // strict 2D view for safety so any future change in build_qkvz's return shape stays correct.
+    qkv_mixed = ggml_reshape_2d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens * n_seqs);
+    cb(qkv_mixed, "batched_qkv_mixed_2d", il);
 
     // beta/gate — build_beta_gate is already parameterized on n_seqs.
     auto [beta, gate] = build_beta_gate(lctx, ctx0, model.layers[il].ssm_beta_alpha, model.layers[il].ssm_beta, model.layers[il].ssm_alpha,
