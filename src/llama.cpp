@@ -3143,9 +3143,44 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_s_seq_qnext->buffer));
         int32_t * data = (int32_t *) lctx.inp_s_seq_qnext->data;
 
+        // If the M2 batched GDN tensors were allocated for this graph, the batched
+        // dispatcher will run ggml_ssm_conv with n_kv=n_seqs and expects sq to map
+        // each token to its own slot (identity). Otherwise the per-seq loop path runs
+        // ssm_conv with n_kv=1 and sq must be zero for every token.
+        const bool batched_active = (lctx.inp_state_indices_qnext != nullptr);
         for (int64_t j = 0; j < n_tokens; ++j) {
-            // qwen3next linear-attention path uses a single local recurrent state slot.
-            data[j] = 0;
+            data[j] = batched_active ? (int32_t) j : 0;
+        }
+    }
+
+    // M2 batched GDN inputs — populated when the tensors were allocated in build_qwen3next/35moe/35.
+    if (lctx.inp_state_indices_qnext && cparams.mtp_op_type == MTP_OP_NONE) {
+        const int64_t n_tokens = batch.n_tokens;
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_state_indices_qnext->buffer));
+        GGML_ASSERT(lctx.inp_state_indices_qnext->type == GGML_TYPE_I32);
+        int32_t * data = (int32_t *) lctx.inp_state_indices_qnext->data;
+
+        const bool has_explicit_seq_info = batch.n_seq_id != nullptr && batch.seq_id != nullptr;
+        for (int64_t j = 0; j < n_tokens; ++j) {
+            if (has_explicit_seq_info && batch.n_seq_id[j] > 0 && batch.seq_id[j] != nullptr) {
+                data[j] = (int32_t) batch.seq_id[j][0];
+            } else {
+                data[j] = 0; // reserve-graph fallback — matches delta_net::delta_net ctor semantics
+            }
+        }
+    }
+
+    if (lctx.inp_qnext_reset_mask && cparams.mtp_op_type == MTP_OP_NONE) {
+        const int64_t n_tokens = batch.n_tokens;
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_qnext_reset_mask->buffer));
+        GGML_ASSERT(lctx.inp_qnext_reset_mask->type == GGML_TYPE_F32);
+        float * data = (float *) lctx.inp_qnext_reset_mask->data;
+
+        // Mirror loop-path reset semantics: state is zeroed when batch.pos[i] == 0.
+        // Batched path multiplies state by this mask → value 0.0 zeros, 1.0 preserves.
+        for (int64_t j = 0; j < n_tokens; ++j) {
+            const bool reset = batch.pos != nullptr && batch.pos[j] == 0;
+            data[j] = reset ? 0.0f : 1.0f;
         }
     }
 

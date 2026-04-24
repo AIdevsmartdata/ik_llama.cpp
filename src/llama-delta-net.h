@@ -17,8 +17,19 @@ struct delta_net {
             ggml_tensor * cur, ggml_tensor * inp_s_seq_qnext, ggml_tensor * inp_out_ids,
             uint32_t state_seq_id_local, bool reset_state_local, int il, const llm_build_cb & cb) const;
 
+    // M2 — batched GDN dispatch. Emits ONE gather + ONE ssm_conv (n_kv=n_seqs) + ONE
+    // ggml_delta_net (n_seqs>1) + ONE scatter per layer, in place of N per-seq sub-graphs.
+    // Runs only when is_batched_dispatch_eligible() returns true (env IK_LLAMA_BATCHED_GDN=1
+    // and pure-decode unique-seq conditions hold). Falls back to the per-seq loop otherwise.
+    ggml_tensor * build_layer_attn_linear_core_batched(ggml_context * ctx0, ggml_cgraph * gf,
+            ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb) const;
+
     ggml_tensor * build_layer_attn_linear(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb) const;
+
+    // M2 — public eligibility predicate so build_qwen3next()/35moe()/35() can decide
+    // at graph-build time whether to allocate the batched input tensors.
+    bool is_batched_dispatch_eligible() const;
 
 private:
 
@@ -27,6 +38,10 @@ private:
     std::vector<llama_seq_id> token_seq_ids;
     bool all_same_seq;
     bool has_unique_seq_ids;
+
+    // Cached at ctor from env IK_LLAMA_BATCHED_GDN. When false (default) the
+    // dispatcher never routes to the batched path; behavior is byte-identical to today.
+    bool batched_gdn_enabled = false;
 
     static std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(llama_context & lctx, ggml_context * ctx0,
             ggml_tensor * wqkv, ggml_tensor * wqkv_gate, ggml_tensor * input, int il, const llm_build_cb & cb, ggml_cgraph * gf);

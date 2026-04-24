@@ -108,6 +108,8 @@ void llm_build_context::init() {
     lctx.inp_s_mask      = nullptr;
     lctx.inp_s_seq       = nullptr;
     lctx.inp_s_seq_qnext = nullptr;
+    lctx.inp_state_indices_qnext = nullptr;
+    lctx.inp_qnext_reset_mask    = nullptr;
     lctx.inp_ssm_ids     = nullptr;
     lctx.inp_pos_bucket    = nullptr;
     lctx.inp_embd_enc      = nullptr;
@@ -4480,6 +4482,17 @@ ggml_cgraph * llm_build_context::build_qwen3next() {
     lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
     cb(lctx.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
     ggml_set_input(lctx.inp_s_seq_qnext);
+    // M2 batched GDN dispatch — allocate indices + reset_mask tensors iff eligible.
+    // When allocated, llama_set_inputs fills inp_s_seq_qnext with identity and ssm_conv
+    // runs with n_kv=n_seqs. When nullptr, today's per-seq loop path runs unchanged.
+    if (delta.is_batched_dispatch_eligible()) {
+        lctx.inp_state_indices_qnext = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        cb(lctx.inp_state_indices_qnext, "inp_state_indices_qnext", -1);
+        ggml_set_input(lctx.inp_state_indices_qnext);
+        lctx.inp_qnext_reset_mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_tokens);
+        cb(lctx.inp_qnext_reset_mask, "inp_qnext_reset_mask", -1);
+        ggml_set_input(lctx.inp_qnext_reset_mask);
+    }
 
     float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
@@ -4565,6 +4578,15 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
     lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
     cb(lctx.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
     ggml_set_input(lctx.inp_s_seq_qnext);
+    // M2 batched GDN dispatch — see build_qwen3next() for rationale.
+    if (delta.is_batched_dispatch_eligible()) {
+        lctx.inp_state_indices_qnext = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        cb(lctx.inp_state_indices_qnext, "inp_state_indices_qnext", -1);
+        ggml_set_input(lctx.inp_state_indices_qnext);
+        lctx.inp_qnext_reset_mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_tokens);
+        cb(lctx.inp_qnext_reset_mask, "inp_qnext_reset_mask", -1);
+        ggml_set_input(lctx.inp_qnext_reset_mask);
+    }
 
     float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
@@ -4649,6 +4671,15 @@ ggml_cgraph * llm_build_context::build_qwen35() {
     lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
     cb(lctx.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
     ggml_set_input(lctx.inp_s_seq_qnext);
+    // M2 batched GDN dispatch — see build_qwen3next() for rationale.
+    if (delta.is_batched_dispatch_eligible()) {
+        lctx.inp_state_indices_qnext = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        cb(lctx.inp_state_indices_qnext, "inp_state_indices_qnext", -1);
+        ggml_set_input(lctx.inp_state_indices_qnext);
+        lctx.inp_qnext_reset_mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_tokens);
+        cb(lctx.inp_qnext_reset_mask, "inp_qnext_reset_mask", -1);
+        ggml_set_input(lctx.inp_qnext_reset_mask);
+    }
 
     float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 

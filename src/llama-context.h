@@ -208,6 +208,11 @@ struct llama_context {
     struct ggml_tensor * inp_s_mask;      // F32 [1, n_kv]
     struct ggml_tensor * inp_s_seq;       // I32 [n_kv, n_batch]
     struct ggml_tensor * inp_s_seq_qnext; // I32 [1, n_batch]
+    // M2 batched-GDN dispatch (opt-in via IK_LLAMA_BATCHED_GDN=1).
+    // Allocated in build_qwen3next/35moe/35 only when batched dispatch is elected.
+    // When non-null: inp_s_seq_qnext is filled with identity (data[j]=j) and ssm_conv runs with n_kv=n_seqs.
+    struct ggml_tensor * inp_state_indices_qnext = nullptr; // I32 [n_seqs] — token/slot mapping for ggml_get_rows/set_rows
+    struct ggml_tensor * inp_qnext_reset_mask    = nullptr; // F32 [n_seqs] — 0.0 if batch.pos[i]==0 else 1.0
     struct ggml_tensor * inp_ssm_ids = nullptr; // I32 [n_seqs] — Phase 3.3 Mamba-2 / Nemotron-H ssm_scan ids input
     struct ggml_tensor * inp_pos_bucket;    // I32 [n_batch|n_kv, n_batch]
     struct ggml_tensor * inp_embd_enc;      // F32 [n_embd, n_outputs_enc]
