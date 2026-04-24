@@ -4479,13 +4479,19 @@ ggml_cgraph * llm_build_context::build_qwen3next() {
     ggml_tensor * inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
     ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
-    lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
+    // M2 batched GDN dispatch — pre-compute eligibility so we can shape inp_s_seq_qnext correctly.
+    // ssm_conv asserts sq->ne[0] == n_kv. Legacy per-seq path uses n_kv=1 → [1, n_tokens].
+    // Batched path uses n_kv=n_seqs; eligibility enforces 1 token per seq, so n_seqs == n_tokens
+    // → shape [n_tokens, n_tokens]. Cost: n_tokens² * 4 B (= 64 B at M=4, 256 B at M=8).
+    const bool batched_eligible = delta.is_batched_dispatch_eligible();
+    const int64_t sq_n_kv = batched_eligible ? n_tokens : 1;
+    lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, sq_n_kv, n_tokens);
     cb(lctx.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
     ggml_set_input(lctx.inp_s_seq_qnext);
     // M2 batched GDN dispatch — allocate indices + reset_mask tensors iff eligible.
     // When allocated, llama_set_inputs fills inp_s_seq_qnext with identity and ssm_conv
     // runs with n_kv=n_seqs. When nullptr, today's per-seq loop path runs unchanged.
-    if (delta.is_batched_dispatch_eligible()) {
+    if (batched_eligible) {
         lctx.inp_state_indices_qnext = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         cb(lctx.inp_state_indices_qnext, "inp_state_indices_qnext", -1);
         ggml_set_input(lctx.inp_state_indices_qnext);
@@ -4575,11 +4581,13 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
     ggml_tensor * inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
     ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
-    lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
+    // M2 batched GDN dispatch — see build_qwen3next() for sq shape rationale.
+    const bool batched_eligible = delta.is_batched_dispatch_eligible();
+    const int64_t sq_n_kv = batched_eligible ? n_tokens : 1;
+    lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, sq_n_kv, n_tokens);
     cb(lctx.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
     ggml_set_input(lctx.inp_s_seq_qnext);
-    // M2 batched GDN dispatch — see build_qwen3next() for rationale.
-    if (delta.is_batched_dispatch_eligible()) {
+    if (batched_eligible) {
         lctx.inp_state_indices_qnext = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         cb(lctx.inp_state_indices_qnext, "inp_state_indices_qnext", -1);
         ggml_set_input(lctx.inp_state_indices_qnext);
@@ -4668,11 +4676,13 @@ ggml_cgraph * llm_build_context::build_qwen35() {
     ggml_tensor * inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
     ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
-    lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
+    // M2 batched GDN dispatch — see build_qwen3next() for sq shape rationale.
+    const bool batched_eligible = delta.is_batched_dispatch_eligible();
+    const int64_t sq_n_kv = batched_eligible ? n_tokens : 1;
+    lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, sq_n_kv, n_tokens);
     cb(lctx.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
     ggml_set_input(lctx.inp_s_seq_qnext);
-    // M2 batched GDN dispatch — see build_qwen3next() for rationale.
-    if (delta.is_batched_dispatch_eligible()) {
+    if (batched_eligible) {
         lctx.inp_state_indices_qnext = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         cb(lctx.inp_state_indices_qnext, "inp_state_indices_qnext", -1);
         ggml_set_input(lctx.inp_state_indices_qnext);

@@ -3147,9 +3147,17 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         // dispatcher will run ggml_ssm_conv with n_kv=n_seqs and expects sq to map
         // each token to its own slot (identity). Otherwise the per-seq loop path runs
         // ssm_conv with n_kv=1 and sq must be zero for every token.
+        //
+        // Layout note: sq is shape [n_kv, n_tokens] in GGML row-major
+        // (ne[0]=n_kv col, ne[1]=n_tokens row). For each token row j, ssm_conv reads
+        // sq[0] = data[j*n_kv] as the kv slot index. Other entries in row j (col 1..)
+        // are unread but must be initialized to avoid UB if any consumer touches them.
         const bool batched_active = (lctx.inp_state_indices_qnext != nullptr);
+        const int64_t n_kv = lctx.inp_s_seq_qnext->ne[0];
+        // Zero junk slots (col 1..n_kv-1 of each row).
+        std::fill(data, data + n_kv * n_tokens, (int32_t) 0);
         for (int64_t j = 0; j < n_tokens; ++j) {
-            data[j] = batched_active ? (int32_t) j : 0;
+            data[j * n_kv] = batched_active ? (int32_t) j : 0;
         }
     }
 
