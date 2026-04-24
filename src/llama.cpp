@@ -96,6 +96,7 @@
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -549,6 +550,10 @@ struct llama_context::Prev {
     int n_kv;
     llama_mtp_op_type mtp_op_type;
     ggml_cgraph * graph;
+    // Added for multi-seq decode reuse:
+    int n_tokens = 1;
+    std::vector<llama_seq_id> seq_ids;     // per-token order; empty when n_tokens == 1
+    uint64_t cache_copies_sig = 0;
 };
 
 void llama_context::reset_scheduler() {
@@ -558,15 +563,46 @@ void llama_context::reset_scheduler() {
 
 bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
     if (!prev || !prev->graph) return false;
-    if (u_batch.n_tokens > 1) return false;
     if (u_batch.embd) return false;
     if (!cparams.graph_reuse) return false;
-    return u_batch.all_seq_id == prev->all_seq_id &&
-           kv_self.head > 0 &&
-           kv_self.n == prev->n_kv &&
-           n_outputs == prev->n_outputs &&
-           cparams.mtp_op_type == prev->mtp_op_type &&
-           update_cache_copies();
+    if (cparams.mtp_op_type != prev->mtp_op_type)  return false;
+    if (kv_self.head == 0)                         return false;
+    if ((int) kv_self.n != prev->n_kv)             return false;
+    if (n_outputs != prev->n_outputs)              return false;
+    if (u_batch.all_seq_id != prev->all_seq_id)    return false;
+    if (u_batch.n_tokens   != prev->n_tokens)      return false;
+
+    if (u_batch.n_tokens > 1) {
+        // Multi-seq decode reuse — opt-out kill switch for bisect / regression isolation.
+        static const bool disable_multiseq = [] {
+            const char * s = std::getenv("IK_LLAMA_DISABLE_REUSE_MULTISEQ");
+            return s && s[0] && s[0] != '0';
+        }();
+        if (disable_multiseq) return false;
+
+        // Graph topology depends on per-token seq_id order: delta_net::build_qkv
+        // bakes state_seq_id_i * state_row_size into the state_dst view offset
+        // (see src/llama-delta-net.cpp:307). Order must match prev tick.
+        if (!u_batch.seq_id || !u_batch.n_seq_id)           return false;
+        if ((int) prev->seq_ids.size() != u_batch.n_tokens) return false;
+        for (int i = 0; i < u_batch.n_tokens; ++i) {
+            if (u_batch.n_seq_id[i] != 1)                   return false; // qwen3next invariant
+            if (!u_batch.seq_id[i])                         return false;
+            if (u_batch.seq_id[i][0] != prev->seq_ids[i])   return false;
+        }
+    }
+
+    if (!update_cache_copies()) return false;
+
+    // Defense in depth: verify the cache_copies layout hasn't been re-vectored under us
+    // (defrag / reset / MTP path switch would invalidate node pointers).
+    uint64_t sig = 0;
+    for (const auto & c : cache_copies) {
+        sig = sig * 0x100000001B3ULL ^ (uint64_t) (uintptr_t) c.cpy;
+    }
+    if (prev->cache_copies_sig != 0 && prev->cache_copies_sig != sig) return false;
+
+    return true;
 }
 
 bool llama_context::update_cache_copies() {
@@ -3581,10 +3617,36 @@ static int llama_decode_internal(
             tim2 = ggml_time_us();
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
 #endif
-            if (u_batch.n_tokens == 1 && u_batch.embd == nullptr && lctx.cparams.graph_reuse) {
-                lctx.prev = std::make_unique<llama_context::Prev>(llama_context::Prev{
-                        (int)u_batch.all_seq_id, (int)lctx.n_outputs, (int)lctx.kv_self.n,
-                        cparams.mtp_op_type, gf});
+            if (u_batch.embd == nullptr && lctx.cparams.graph_reuse) {
+                auto p = std::make_unique<llama_context::Prev>();
+                p->all_seq_id  = (int) u_batch.all_seq_id;
+                p->n_outputs   = (int) lctx.n_outputs;
+                p->n_kv        = (int) lctx.kv_self.n;
+                p->mtp_op_type = cparams.mtp_op_type;
+                p->graph       = gf;
+                p->n_tokens    = (int) u_batch.n_tokens;
+                bool seq_ids_ok = true;
+                if (u_batch.n_tokens > 1) {
+                    if (!u_batch.seq_id || !u_batch.n_seq_id) {
+                        seq_ids_ok = false;
+                    } else {
+                        p->seq_ids.reserve(u_batch.n_tokens);
+                        for (int i = 0; i < u_batch.n_tokens; ++i) {
+                            if (u_batch.n_seq_id[i] != 1 || !u_batch.seq_id[i]) { seq_ids_ok = false; break; }
+                            p->seq_ids.push_back(u_batch.seq_id[i][0]);
+                        }
+                    }
+                }
+                if (seq_ids_ok) {
+                    uint64_t sig = 0;
+                    for (const auto & c : lctx.cache_copies) {
+                        sig = sig * 0x100000001B3ULL ^ (uint64_t) (uintptr_t) c.cpy;
+                    }
+                    p->cache_copies_sig = sig;
+                    lctx.prev = std::move(p);
+                } else {
+                    lctx.prev.reset();
+                }
             }
         } else {
             //printf("Reusing graph\n");
