@@ -627,7 +627,14 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     // batched input tensors were allocated by build_qwen3next/35moe/35 (i.e. eligibility
     // ALSO held at graph-build time). If either is false, fall through to the per-seq
     // loop below — preserving today's behavior byte-for-byte.
-    if (is_batched_dispatch_eligible() && lctx.inp_state_indices_qnext != nullptr && lctx.inp_qnext_reset_mask != nullptr) {
+    //
+    // Note: inp_qnext_reset_mask is conditionally allocated (only when batch.pos has any 0
+    // for this graph build, see fix 3). The batched core handles the nullptr case internally
+    // by skipping the multiply. We MUST NOT gate on inp_qnext_reset_mask here: doing so would
+    // re-route to the per-seq loop, which then mis-views inp_s_seq_qnext (allocated
+    // [n_tokens, n_tokens] when batched_eligible, see fix 2) as the legacy [1, n_tokens]
+    // shape, and ssm_conv would read out-of-range slot indices → silent corruption / asserts.
+    if (is_batched_dispatch_eligible() && lctx.inp_state_indices_qnext != nullptr) {
         return build_layer_attn_linear_core_batched(ctx0, gf, cur, inp_out_ids, il, cb);
     }
 
