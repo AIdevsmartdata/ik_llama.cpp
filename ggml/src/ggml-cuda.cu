@@ -2328,7 +2328,11 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
             CUDA_CHECK(cudaGetLastError());
         }
     } else {
-        quantize_mmq_q8_1_cuda((const float *)src1->data, src1_quantized.get(), src1->ne[0], src1->ne[1], 1, ne10_padded, src0->type, stream);
+        // Fix 2026-04-25: pass src1->ne[2] (channels), not hardcoded 1, otherwise heterogeneous
+        // multi-seq batches (M=4 native scheduler, varying prompt lengths) have only the first
+        // channel quantized, mul_mat_q reads OOB on subsequent channels → CUDA illegal memory
+        // access surfaced at next cudaGetLastError. Bug introduced by commit 277fc1d2 (DRY refactor).
+        quantize_mmq_q8_1_cuda((const float *)src1->data, src1_quantized.get(), src1->ne[0], src1->ne[1], src1->ne[2], ne10_padded, src0->type, stream);
         CUDA_CHECK(cudaGetLastError());
 
         ggml_cuda_op_mul_mat_q(ctx, src0, src1, dst, (const char *)src0->data, nullptr, src1_quantized.get(), (float *)dst->data,
@@ -3342,7 +3346,9 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
     } else {
 
         if (ggml_cuda_should_use_mmq(src0_1->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[1])) {
-            quantize_mmq_q8_1_cuda((const float *)src1->data, src1_quantized.get(), src1->ne[0], src1->ne[1], 1,
+            // Fix 2026-04-25: same as line ~2335 — pass src1->ne[2], not 1, otherwise heterogeneous
+            // multi-seq batches in fused Q/K/V path quantize only first channel → mul_mat_q OOB.
+            quantize_mmq_q8_1_cuda((const float *)src1->data, src1_quantized.get(), src1->ne[0], src1->ne[1], src1->ne[2],
                     ne10_padded, src0_1->type, stream);
             CUDA_CHECK(cudaGetLastError());
 
