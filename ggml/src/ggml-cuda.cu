@@ -2328,43 +2328,16 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
             CUDA_CHECK(cudaGetLastError());
         }
     } else {
-        // Fix 2026-04-25: pass src1->ne[2] (channels), not hardcoded 1, otherwise heterogeneous
-        // multi-seq batches (M=4 native scheduler, varying prompt lengths) have only the first
-        // channel quantized. Bug introduced by commit 277fc1d2 (DRY refactor).
-        //
-        // Fix 2026-04-26: quantize_mmq_q8_1 kernel assumes src1 is dense contiguous
-        // (uses x[(ix1*kx0+ix0)/4] without honoring src1->nb[1..3] strides). When
-        // src1 is a permute/view (common in multi-seq M>=3 MoE routing), this reads
-        // OOB → CUDA illegal memory access. Diagnostic warning + materialize contiguous
-        // copy via cudaMemcpy3DAsync if src1 is non-contiguous. Upstream llama.cpp
-        // refactored this kernel with explicit strides (s01/s02/s03); ik_llama is
-        // pre-refactor — this is the workaround at the dispatcher level.
-        const float * src1_q_data = (const float *) src1->data;
-        ggml_cuda_pool_alloc<float> src1_contig_pool(ctx.pool());
-        if (!ggml_is_contiguous(src1)) {
-            static std::atomic<int> warn_count{0};
-            if (warn_count.fetch_add(1) < 3) {
-                fprintf(stderr,
-                    "[ggml-cuda] mul_mat_q: src1 non-contiguous, ne=[%lld,%lld,%lld,%lld] "
-                    "nb=[%zu,%zu,%zu,%zu] — materializing contiguous copy (workaround)\n",
-                    (long long)src1->ne[0], (long long)src1->ne[1],
-                    (long long)src1->ne[2], (long long)src1->ne[3],
-                    src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3]);
-            }
-            const int64_t n_elem = src1->ne[0] * src1->ne[1] * src1->ne[2] * src1->ne[3];
-            src1_contig_pool.alloc(n_elem);
-            // Use cudaMemcpy3DAsync to copy with strides correctly.
-            cudaMemcpy3DParms cp = {};
-            cp.srcPtr = make_cudaPitchedPtr(src1->data, src1->nb[1], src1->ne[0] * sizeof(float), src1->ne[1]);
-            cp.dstPtr = make_cudaPitchedPtr(src1_contig_pool.get(),
-                                             src1->ne[0] * sizeof(float),
-                                             src1->ne[0] * sizeof(float), src1->ne[1]);
-            cp.extent = make_cudaExtent(src1->ne[0] * sizeof(float), src1->ne[1], src1->ne[2] * src1->ne[3]);
-            cp.kind = cudaMemcpyDeviceToDevice;
-            CUDA_CHECK(cudaMemcpy3DAsync(&cp, stream));
-            src1_q_data = src1_contig_pool.get();
-        }
-        quantize_mmq_q8_1_cuda(src1_q_data, src1_quantized.get(), src1->ne[0], src1->ne[1], src1->ne[2], ne10_padded, src0->type, stream);
+        // Fix 2026-04-26 (v2): use stride-aware quantize launcher to handle non-contiguous src1
+        // (common in multi-seq M>=3 MoE routing where src1 is a permute/view). The previous
+        // contiguous-only kernel read uninitialized memory at strided positions → mul_mat_q
+        // downstream surfaced CUDA illegal memory access. Strides s01/s02 in float elements.
+        // For dense contiguous tensors this matches the legacy formula exactly.
+        // Original 2026-04-25 fix (channels=src1->ne[2] vs hardcoded 1) preserved.
+        const int64_t s01 = src1->nb[1] / sizeof(float);
+        const int64_t s02 = src1->nb[2] / sizeof(float);
+        quantize_mmq_q8_1_strided_cuda((const float *)src1->data, src1_quantized.get(),
+            src1->ne[0], src1->ne[1], src1->ne[2], ne10_padded, s01, s02, src0->type, stream);
         CUDA_CHECK(cudaGetLastError());
 
         ggml_cuda_op_mul_mat_q(ctx, src0, src1, dst, (const char *)src0->data, nullptr, src1_quantized.get(), (float *)dst->data,
