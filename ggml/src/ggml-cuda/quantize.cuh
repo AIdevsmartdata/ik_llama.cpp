@@ -43,5 +43,12 @@ void quantize_mmq_q8_1_id_cuda(
     const float * x, void * vy, const char * row_mapping, const int64_t kx0, const int64_t kx1, const int64_t kx0_padded,
     const ggml_type type_x, cudaStream_t stream);
 
+// Stride-aware variant for non-contiguous src1 in MoE expert routing (2026-04-26).
+// s01 = stride between rows in float elements (typically src->nb[1]/sizeof(float)).
+void quantize_mmq_q8_1_id_strided_cuda(
+    const float * x, void * vy, const char * row_mapping,
+    const int64_t kx0, const int64_t kx1, const int64_t kx0_padded, const int64_t s01,
+    const ggml_type type_x, cudaStream_t stream);
+
 // For now only applicable for tensors with ne[1] = 1, ne[3] = 1, and useful if ne[2] > 1
 void quantize_tensor_q8_1_cuda(const struct ggml_tensor * src, void * vy, const enum ggml_type type, cudaStream_t stream);

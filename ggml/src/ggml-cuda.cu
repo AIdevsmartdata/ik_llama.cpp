@@ -3166,8 +3166,12 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
         size_t mapping_offset = cum_moe_counts[i02];
 
         if (use_quantized_src1) {
-            quantize_mmq_q8_1_id_cuda((const float *)src1->data, src1_quantized.get(), (const char *)(dev_row_mapping.get() + mapping_offset),
-                    src1->ne[0], num_src1_rows, src1_padded_num_cols, src0_1->type, stream);
+            // Fix 2026-04-26: stride-aware variant — src1 may be non-contiguous in MoE
+            // expert routing (gather/permute through routing weights).
+            const int64_t s01 = src1->nb[1] / sizeof(float);
+            quantize_mmq_q8_1_id_strided_cuda((const float *)src1->data, src1_quantized.get(),
+                    (const char *)(dev_row_mapping.get() + mapping_offset),
+                    src1->ne[0], num_src1_rows, src1_padded_num_cols, s01, src0_1->type, stream);
             CUDA_CHECK(cudaGetLastError());
             src1_row.data = src1_quantized.get();
         }
