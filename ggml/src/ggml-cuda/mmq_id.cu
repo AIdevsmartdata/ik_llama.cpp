@@ -372,11 +372,14 @@ void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor *
             const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1
                                           + get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
             src1_q8_1.alloc(nbytes_src1_q8_1);
-            // Fix 2026-04-25: pass ne12*ne13 (channels), not hardcoded 1. The buffer above is
-            // sized ne13*ne12*ne11*ne10_padded — quantize must fill all channels otherwise mul_mat_id
-            // reads garbage on experts > 0 → CUDA illegal memory access. Same bug-shape as
-            // ggml-cuda.cu:2331 introduced by commit 277fc1d2 (DRY refactor).
-            quantize_mmq_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, ne11, ne12*ne13, ne10_padded, src0->type, stream);
+            // Fix 2026-04-25: pass ne12*ne13 (channels), not hardcoded 1.
+            // Fix 2026-04-26: use stride-aware variant — src1 may be non-contiguous (gather/permute
+            // common in MoE expert routing). Without strides, kernel reads uninit memory → mul_mat_id
+            // reads garbage on experts > 0 → CUDA illegal memory access. Bug located here by cuda-gdb.
+            const int64_t s01 = src1->nb[1] / sizeof(float);
+            const int64_t s02 = src1->nb[2] / sizeof(float);
+            quantize_mmq_q8_1_strided_cuda(src1_d, src1_q8_1.get(), ne10, ne11, ne12*ne13,
+                                            ne10_padded, s01, s02, src0->type, stream);
             CUDA_CHECK(cudaGetLastError());
             src1_quantized_data = src1_q8_1.get();
         }
