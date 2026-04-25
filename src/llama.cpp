@@ -3862,7 +3862,11 @@ static int llama_decode_internal(
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     lctx.n_outputs = n_outputs;
 
-    // wait for the computation to finish (automatically done when obtaining the model output)
+    // Fix 2026-04-25: uncommented to prevent CUDA async race in M=4 multi-slot native scheduler.
+    // Without this sync, llama_decode_internal returns while kernels are still queued on the
+    // CUDA stream. When the scheduler immediately reuses a slot (kv_cache_seq_rm + new prefill),
+    // pending kernels race against new writes to the same KV cells → CUDA illegal memory access.
+    // CUDA_LAUNCH_BLOCKING=1 cures the bug, confirming it's an async stream-ordering issue.
     //llama_synchronize(&lctx);
 
     // decide if we need to defrag the kv cache
@@ -6025,11 +6029,24 @@ int32_t llama_get_kv_cache_used_cells(const struct llama_context * ctx) {
     return ctx->kv_self.used;
 }
 
+// Fix 2026-04-26: sync GPU before mutating KV cache sequence ownership.
+// llama_kv_cache_seq_* are CPU-only ops on cache.cells[] metadata, but the
+// KV pages they free/reassign may still be in flight on the CUDA stream
+// from a previous llama_decode. Without sync, a subsequent llama_decode on
+// a re-seated slot can write to KV pages while the previous kernel is still
+// reading them → CUDA illegal memory access in mul_mat_q (deferred error).
+// Empirical: M=4 native scheduler crashes within 5s without these syncs;
+// adding sync in seq_rm is the chirurgical fix recommended by Agent#2 sync
+// audit (audit-sync-sites 2026-04-25). cudaStreamSynchronize cost is paid
+// only on slot reuse (rare, vs ~per-tick decode), so steady-state perf is
+// unaffected.
 void llama_kv_cache_clear(struct llama_context * ctx) {
+    ggml_backend_sched_synchronize(ctx->sched);
     llama_kv_cache_clear(ctx->kv_self);
 }
 
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    ggml_backend_sched_synchronize(ctx->sched);
     return llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
 }
 
@@ -6037,10 +6054,12 @@ void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, 
     if (seq_id_src == seq_id_dst) {
         return;
     }
+    ggml_backend_sched_synchronize(ctx->sched);
     llama_kv_cache_seq_cp(ctx->kv_self, seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_kv_cache_seq_keep(struct llama_context * ctx, llama_seq_id seq_id) {
+    ggml_backend_sched_synchronize(ctx->sched);
     llama_kv_cache_seq_keep(ctx->kv_self, seq_id);
 }
 
@@ -6048,7 +6067,7 @@ void llama_kv_cache_seq_add(struct llama_context * ctx, llama_seq_id seq_id, lla
     if (delta == 0) {
         return;
     }
-
+    ggml_backend_sched_synchronize(ctx->sched);
     llama_kv_cache_seq_add(ctx->kv_self, seq_id, p0, p1, delta);
 }
 
@@ -6056,7 +6075,7 @@ void llama_kv_cache_seq_div(struct llama_context * ctx, llama_seq_id seq_id, lla
     if (d == 1) {
         return;
     }
-
+    ggml_backend_sched_synchronize(ctx->sched);
     llama_kv_cache_seq_div(ctx->kv_self, seq_id, p0, p1, d);
 }
 
