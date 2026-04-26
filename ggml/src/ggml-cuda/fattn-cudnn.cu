@@ -86,6 +86,41 @@ static inline void launch_cast_q_strided(
         H, S, D);
 }
 
+// Stride-aware F16 → F16 copy for K/V (non-contiguous views to dense BHSD).
+static __global__ void k_copy_kv_to_dense_bhsd(
+        const half * __restrict__ src,
+        half       * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const int64_t nb0, const int64_t nb1, const int64_t nb2, const int64_t nb3,
+        const int64_t H, const int64_t S, const int64_t D) {
+    const int64_t total = ne3 * ne2 * ne1 * ne0;
+    const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int64_t i = idx;
+    const int64_t d = i % ne0; i /= ne0;
+    const int64_t s = i % ne1; i /= ne1;
+    const int64_t h = i % ne2;
+    const int64_t b = i / ne2;
+    const char * p = (const char*)src + b*nb3 + h*nb2 + s*nb1 + d*nb0;
+    const half v = *(const half*)p;
+    const int64_t out_idx = ((b * H + h) * S + s) * D + d;
+    dst[out_idx] = v;
+}
+
+static inline void launch_copy_kv_strided(
+        const ggml_tensor * T, half * dense,
+        int64_t H, int64_t S, int64_t D, cudaStream_t stream) {
+    const int64_t total = T->ne[0] * T->ne[1] * T->ne[2] * T->ne[3];
+    if (total <= 0) return;
+    const int block = 256;
+    const int grid  = (int)((total + block - 1) / block);
+    k_copy_kv_to_dense_bhsd<<<grid, block, 0, stream>>>(
+        (const half*)T->data, dense,
+        T->ne[0], T->ne[1], T->ne[2], T->ne[3],
+        T->nb[0], T->nb[1], T->nb[2], T->nb[3],
+        H, S, D);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -387,11 +422,28 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
     key.S_kv     = K->ne[1];
     key.D_qk     = Q->ne[0];
     key.D_v      = V->ne[0];
-    // Q gets cast to HALF in dense BHSD (we wrote it that way below). K/V
-    // honor their actual ggml strides (they may be views of the KV cache).
+    // Q gets cast to HALF in dense BHSD (we wrote it that way below).
+    // K/V also copied to dense BHSD if non-contig (P5 fix), so use canonical strides.
     compute_stride(Q,   key.q_stride, /*dense_half_after_cast=*/true);
-    compute_stride(K,   key.k_stride, /*dense_half_after_cast=*/false);
-    compute_stride(V,   key.v_stride, /*dense_half_after_cast=*/false);
+    // For K/V: if we'll copy to dense, use canonical BHSD strides; else use ggml's.
+    const bool k_will_be_dense = !ggml_is_contiguous(K);
+    const bool v_will_be_dense = !ggml_is_contiguous(V);
+    if (k_will_be_dense) {
+        key.k_stride[0] = key.H_k * key.S_kv * key.D_qk;
+        key.k_stride[1] = key.S_kv * key.D_qk;
+        key.k_stride[2] = key.D_qk;
+        key.k_stride[3] = 1;
+    } else {
+        compute_stride(K, key.k_stride, false);
+    }
+    if (v_will_be_dense) {
+        key.v_stride[0] = key.H_k * key.S_kv * key.D_v;
+        key.v_stride[1] = key.S_kv * key.D_v;
+        key.v_stride[2] = key.D_v;
+        key.v_stride[3] = 1;
+    } else {
+        compute_stride(V, key.v_stride, false);
+    }
     compute_stride(dst, key.o_stride, /*dense_half_after_cast=*/false);
     key.q_dtype  = (int32_t) Q->type;
     key.kv_dtype = (int32_t) K->type;
@@ -446,6 +498,28 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         q_data = q_f16.ptr;
     }
 
+    // P5 fix: copy K and V to dense BHSD buffers if they're non-contiguous.
+    // cuDNN SDPA engines on sm_120 may have undocumented alignment constraints
+    // that silently misinterpret non-contig F16 views even with correct strides.
+    static const bool no_kv_dense = []{
+        const char * s = std::getenv("IK_LLAMA_FA_NO_KV_DENSE");
+        return s && std::strcmp(s, "0") != 0;
+    }();
+    ggml_cuda_pool_alloc<half> K_dense(ctx.pool());
+    ggml_cuda_pool_alloc<half> V_dense(ctx.pool());
+    void * k_data = K->data;
+    void * v_data = V->data;
+    if (!no_kv_dense && !ggml_is_contiguous(K)) {
+        K_dense.alloc(key.B * key.H_k * key.S_kv * key.D_qk);
+        launch_copy_kv_strided(K, K_dense.ptr, key.H_k, key.S_kv, key.D_qk, stream);
+        k_data = K_dense.ptr;
+    }
+    if (!no_kv_dense && !ggml_is_contiguous(V)) {
+        V_dense.alloc(key.B * key.H_k * key.S_kv * key.D_v);
+        launch_copy_kv_strided(V, V_dense.ptr, key.H_k, key.S_kv, key.D_v, stream);
+        v_data = V_dense.ptr;
+    }
+
     // HALF intermediate buffer; cast back to F32 dst after execute.
     const int64_t out_nelem = key.B * key.H_q * key.S_q * key.D_v;
     ggml_cuda_pool_alloc<half> o_f16(ctx.pool());
@@ -453,8 +527,8 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
 
     std::unordered_map<int64_t, void *> variant_pack = {
         {UID_Q, q_data},
-        {UID_K, K->data},
-        {UID_V, V->data},
+        {UID_K, k_data},
+        {UID_V, v_data},
         {UID_O, o_f16.ptr},
     };
     static const bool no_bias = []{
