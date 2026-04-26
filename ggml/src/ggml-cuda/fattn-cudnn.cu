@@ -267,10 +267,10 @@ static fa_graph_entry build_graph(const fa_cache_key & k, cudnnHandle_t handle, 
                     .set_name("ggml_fa_sdpa")
                     .set_generate_stats(false);
 
-    // Pass scale as a static scale via attribute (read from op_params at execute time
-    // would require dynamic plan; we set 1.0 here and apply scale via attn_bias mul,
-    // OR rebuild graph per scale. ggml scale is fixed per layer so cache key suffices.)
-    // For J2 simplicity, treat scale as build-time: caller computes 1/sqrt(D).
+    // attn_scale baked at graph build time. ggml's scale is in op_params[0]; for
+    // standard transformers it equals 1/sqrt(D_qk) but Gemma/MLA may differ. We
+    // store the scale as a constant tensor; cuDNN inlines it.
+    // (Source of truth at execute time still verified via op_params[0] in entry().)
     opts.set_attn_scale(1.0f / std::sqrt(float(k.D_qk)));
 
     if (k.causal) {
@@ -515,6 +515,52 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
             for (int i=0;i<N;++i) fprintf(stderr, "%+.4e,", (double)dh[i]);
             fprintf(stderr, " S_kv=%lld\n", (long long)key.S_kv);
             fflush(stderr);
+        }
+    }
+
+    // Verify scale matches our build-time hardcode; abort if model uses different.
+    {
+        float scale_op = 0.f;
+        std::memcpy(&scale_op, (const float*)dst->op_params + 0, sizeof(float));
+        const float scale_expected = 1.0f / std::sqrt(float(key.D_qk));
+        if (std::fabs(scale_op - scale_expected) > 1e-4f) {
+            fprintf(stderr, "[fa-cudnn] scale mismatch: op_params=%f expected=%f — fallback unsupported\n",
+                scale_op, scale_expected);
+            GGML_ABORT("custom scale not yet supported in cuDNN backend");
+        }
+    }
+
+    // Diagnostic: dump mask validity across calls to verify causal coverage grows
+    {
+        static int mask_dump_n = 0;
+        if (mask && mask_dump_n++ < 30) {
+            cudaStreamSynchronize(stream);
+            std::vector<uint16_t> mh(std::min((int64_t)64, mask->ne[0]));
+            cudaMemcpy(mh.data(), mask->data, mh.size()*2, cudaMemcpyDeviceToHost);
+            int nvalid = 0;
+            for (size_t i=0; i<mh.size(); ++i) {
+                half hv; std::memcpy(&hv, &mh[i], 2);
+                if (__half2float(hv) == 0.0f) nvalid++;
+            }
+            // Dump first 8 mask values as hex + decoded
+            fprintf(stderr, "[fa-cudnn-mask] CALL %d: nvalid_64=%d S_kv=%lld S_q=%lld | hex=", mask_dump_n - 1, nvalid, (long long)key.S_kv, (long long)key.S_q);
+            for (int i = 0; i < 8 && i < (int)mh.size(); ++i) {
+                half hv; std::memcpy(&hv, &mh[i], 2);
+                float f = __half2float(hv);
+                fprintf(stderr, "%04x(%s) ", mh[i], std::isinf(f) ? "-inf" : (f == 0.0f ? "0" : "?"));
+            }
+            // Also dump row 1 (s_q=1) first 8 if mask has multiple rows
+            if (mask->ne[1] >= 2) {
+                std::vector<uint16_t> mh1(8);
+                cudaMemcpy(mh1.data(), (const char*)mask->data + mask->nb[1], 16, cudaMemcpyDeviceToHost);
+                fprintf(stderr, "| row1=");
+                for (int i = 0; i < 8; ++i) {
+                    half hv; std::memcpy(&hv, &mh1[i], 2);
+                    float f = __half2float(hv);
+                    fprintf(stderr, "%04x(%s) ", mh1[i], std::isinf(f) ? "-inf" : (f == 0.0f ? "0" : "?"));
+                }
+            }
+            fprintf(stderr, "\n");
         }
     }
 
