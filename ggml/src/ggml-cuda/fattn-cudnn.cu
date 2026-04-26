@@ -278,7 +278,11 @@ static fa_graph_entry build_graph(const fa_cache_key & k, cudnnHandle_t handle, 
             .set_diagonal_band_right_bound(0);
     }
 
-    if (has_bias_tensor) {
+    static const bool no_bias_build = []{
+        const char * s = std::getenv("IK_LLAMA_FA_NO_BIAS");
+        return s && std::strcmp(s, "0") != 0;
+    }();
+    if (has_bias_tensor && !no_bias_build) {
         // ggml mask: F16, dim [S_kv, S_q_padded, 1, 1], stride nb1=S_kv*sizeof(half).
         // Broadcast across B and H by setting their strides to 0; for S_q dimension
         // the stride is the row size of the ggml mask in HALF elements.
@@ -444,7 +448,11 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         {UID_V, V->data},
         {UID_O, o_f16.ptr},
     };
-    if (mask) { variant_pack[UID_BIAS] = mask->data; }
+    static const bool no_bias = []{
+        const char * s = std::getenv("IK_LLAMA_FA_NO_BIAS");
+        return s && std::strcmp(s, "0") != 0;
+    }();
+    if (mask && !no_bias) { variant_pack[UID_BIAS] = mask->data; }
 
     {
         static int debug_n = 0;

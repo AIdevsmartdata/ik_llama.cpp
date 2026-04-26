@@ -43,7 +43,16 @@ static inline void ik_fa_dump_dst_post(ggml_tensor * dst, cudaStream_t stream) {
     const int N = 4;
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * M = dst->src[3];
-    fprintf(stderr, "[ik-fa-dump] CALL %d: K_ne=%lld,%lld,%lld K_nb=%zu,%zu,%zu V_ne=%lld,%lld,%lld V_nb=%zu,%zu,%zu mask=%p ",
+    // Dump |Q|_max amplitude — discriminates double-scaling
+    if (Q->type == GGML_TYPE_F32) {
+        std::vector<float> qsamp(128);
+        cudaMemcpy(qsamp.data(), Q->data, 128*4, cudaMemcpyDeviceToHost);
+        float qmax = 0;
+        for (auto v : qsamp) qmax = std::max(qmax, std::fabs(v));
+        fprintf(stderr, "[ik-fa-dump] CALL %d: |Q|_max=%.4f K_type=%d K_contig=%d ",
+            dump_n - 1, qmax, (int)K->type, (int)ggml_is_contiguous(K));
+    } else fprintf(stderr, "[ik-fa-dump] CALL %d: ", dump_n - 1);
+    fprintf(stderr, "K_ne=%lld,%lld,%lld K_nb=%zu,%zu,%zu V_ne=%lld,%lld,%lld V_nb=%zu,%zu,%zu mask=%p ",
         dump_n - 1,
         (long long)K->ne[0], (long long)K->ne[1], (long long)K->ne[2],
         K->nb[0], K->nb[1], K->nb[2],
