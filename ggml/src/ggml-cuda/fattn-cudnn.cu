@@ -263,7 +263,14 @@ static fa_graph_entry build_graph(const fa_cache_key & k, cudnnHandle_t handle, 
     // cuDNN SDPA requires Q to match K/V dtype. ggml passes Q as F32 always
     // (asserted in launch_fattn). We cast Q F32→HALF in a pool buffer before
     // calling cuDNN. So inside the graph, Q is treated as HALF.
-    auto kv_dtype = (k.kv_dtype == GGML_TYPE_BF16) ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF;
+    // P9: env IK_LLAMA_FA_BF16=1 forces BF16 io (8-bit exponent, no overflow on softmax).
+    static const bool use_bf16 = []{
+        const char * s = std::getenv("IK_LLAMA_FA_BF16");
+        return s && std::strcmp(s, "0") != 0;
+    }();
+    auto kv_dtype = use_bf16 ? fe::DataType_t::BFLOAT16
+                  : (k.kv_dtype == GGML_TYPE_BF16) ? fe::DataType_t::BFLOAT16
+                  : fe::DataType_t::HALF;
     auto q_dtype  = kv_dtype;
 
     graph->set_io_data_type(kv_dtype)
@@ -611,9 +618,14 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
 
     // Verify scale matches our build-time hardcode; abort if model uses different.
     {
-        float scale_op = 0.f;
+        float scale_op = 0.f, softcap = 0.f, max_bias = 0.f;
         std::memcpy(&scale_op, (const float*)dst->op_params + 0, sizeof(float));
+        std::memcpy(&max_bias, (const float*)dst->op_params + 1, sizeof(float));
+        std::memcpy(&softcap,  (const float*)dst->op_params + 2, sizeof(float));
         const float scale_expected = 1.0f / std::sqrt(float(key.D_qk));
+        static int sd = 0;
+        if (sd++ < 2) fprintf(stderr, "[scale] op[0]=%.10f hardcode=%.10f max_bias=%.4f softcap=%.4f\n",
+            scale_op, scale_expected, max_bias, softcap);
         if (std::fabs(scale_op - scale_expected) > 1e-4f) {
             fprintf(stderr, "[fa-cudnn] scale mismatch: op_params=%f expected=%f — fallback unsupported\n",
                 scale_op, scale_expected);

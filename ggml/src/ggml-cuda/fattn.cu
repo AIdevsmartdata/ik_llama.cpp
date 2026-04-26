@@ -71,6 +71,15 @@ static inline void ik_fa_dump_dst_post(ggml_tensor * dst, cudaStream_t stream) {
         cudaMemcpy(dh.data(), dst->data, N*4, cudaMemcpyDeviceToHost);
         fprintf(stderr, " dst_h0=");
         for (int i=0;i<N;++i) fprintf(stderr, "%+.3e,", (double)dh[i]);
+        // P10: full L2/max/mean of dst (first 12*128 = 1536 floats)
+        if (dump_n == 1) {
+            const int total = (int)(dst->ne[0] * dst->ne[1] * dst->ne[2]);
+            std::vector<float> all(total);
+            cudaMemcpy(all.data(), dst->data, total*4, cudaMemcpyDeviceToHost);
+            float sum2 = 0, max_abs = 0, mean = 0;
+            for (auto v : all) { sum2 += v*v; max_abs = std::max(max_abs, std::fabs(v)); mean += v; }
+            fprintf(stderr, " | L2=%.6g max=%.6g mean=%.6g (n=%d)", std::sqrt(sum2), max_abs, mean/total, total);
+        }
         // dst layout probe: head 1 at LINEAR offset D*4 bytes vs nb-STRIDED offset nb[2]
         std::vector<float> dh_lin(N), dh_nb(N);
         cudaMemcpy(dh_lin.data(), (const char*)dst->data + dst->ne[0]*4, N*4, cudaMemcpyDeviceToHost);
