@@ -16,6 +16,8 @@
 #include "fattn.cuh"
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include <vector>
 #include "convert.cuh"
 
 #include <cstdint>
@@ -24,6 +26,54 @@
 
 static inline bool mma_better_than_turing(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) > CC_TURING;
+}
+
+// Diagnostic: dump V[kv=0, h_k=0, d=0..3] (input) + dst[d=0..3] (output) per call.
+static inline void ik_fa_dump_dst_post(ggml_tensor * dst, cudaStream_t stream) {
+    static const bool enabled = []{
+        const char * s = std::getenv("IK_LLAMA_FA_DUMP");
+        return s && std::strcmp(s, "0") != 0;
+    }();
+    if (!enabled) return;
+    static int dump_n = 0;
+    if (dump_n++ >= 200) return;
+    cudaStreamSynchronize(stream);
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * V = dst->src[2];
+    const int N = 4;
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * M = dst->src[3];
+    fprintf(stderr, "[ik-fa-dump] CALL %d: K_ne=%lld,%lld,%lld K_nb=%zu,%zu,%zu V_ne=%lld,%lld,%lld V_nb=%zu,%zu,%zu mask=%p ",
+        dump_n - 1,
+        (long long)K->ne[0], (long long)K->ne[1], (long long)K->ne[2],
+        K->nb[0], K->nb[1], K->nb[2],
+        (long long)V->ne[0], (long long)V->ne[1], (long long)V->ne[2],
+        V->nb[0], V->nb[1], V->nb[2],
+        M ? M->data : (void*)0);
+    // V[kv=0, h_k=0, d=0..3] — F16 in ggml; first 4 elements at V->data offset 0
+    if (V->type == GGML_TYPE_F16) {
+        std::vector<uint16_t> vh(N);
+        cudaMemcpy(vh.data(), V->data, N*2, cudaMemcpyDeviceToHost);
+        fprintf(stderr, "V_h0_kv0=");
+        for (int i=0;i<N;++i) { half hv; std::memcpy(&hv,&vh[i],2); fprintf(stderr, "%+.3e,", (double)__half2float(hv)); }
+    }
+    if (dst->type == GGML_TYPE_F32) {
+        std::vector<float> dh(N);
+        cudaMemcpy(dh.data(), dst->data, N*4, cudaMemcpyDeviceToHost);
+        fprintf(stderr, " dst_h0=");
+        for (int i=0;i<N;++i) fprintf(stderr, "%+.3e,", (double)dh[i]);
+        // dst layout probe: head 1 at LINEAR offset D*4 bytes vs nb-STRIDED offset nb[2]
+        std::vector<float> dh_lin(N), dh_nb(N);
+        cudaMemcpy(dh_lin.data(), (const char*)dst->data + dst->ne[0]*4, N*4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(dh_nb.data(), (const char*)dst->data + dst->nb[2], N*4, cudaMemcpyDeviceToHost);
+        fprintf(stderr, " dst_h1@D=");
+        for (int i=0;i<N;++i) fprintf(stderr, "%+.3e,", (double)dh_lin[i]);
+        fprintf(stderr, " dst_h1@nb2=");
+        for (int i=0;i<N;++i) fprintf(stderr, "%+.3e,", (double)dh_nb[i]);
+    }
+    fprintf(stderr, " S_q=%lld H_q=%lld S_kv=%lld\n",
+        (long long)Q->ne[1], (long long)Q->ne[2], (long long)dst->src[1]->ne[1]);
+    fflush(stderr);
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -37,6 +87,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int32_t precision = KQV->op_params[3];
     const int32_t n_swa = KQV->op_params[4];
+
+    // RAII dump-on-exit so every return path is covered uniformly.
+    struct DumpOnExit {
+        ggml_tensor * dst; cudaStream_t s;
+        ~DumpOnExit() { ik_fa_dump_dst_post(dst, s); }
+    } _ik_dump_guard{dst, ctx.stream()};
 
     // 2026-04-26: cuDNN SDPA path. Activated by env IK_LLAMA_FA_BACKEND=cudnn.
     // Fixes Blackwell sm_120 multi-seq M>=3 illegal-memory-access bug in legacy

@@ -170,10 +170,18 @@ void ggml_cuda_op_mul_mat_q(
     GGML_UNUSED(src1_ddf_i);
 }
 
+extern "C" char * getenv(const char *) noexcept;
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
+    // Diagnostic 2026-04-26: runtime kill switch. If set, bypass MMQ → cuBLAS path.
+    // Tests whether the M>=3 multi-seq illegal memory access lives in MMQ kernel itself.
+    static const bool disable_mmq = []{
+        const char * e = std::getenv("IK_LLAMA_DISABLE_MMQ");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (disable_mmq) return false;
 
     bool mmq_supported;
 

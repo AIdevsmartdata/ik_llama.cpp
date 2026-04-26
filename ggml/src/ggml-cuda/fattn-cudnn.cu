@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cstdio>
 #include <cmath>
 #include <mutex>
 #include <unordered_map>
@@ -239,14 +240,15 @@ static fa_graph_entry build_graph(const fa_cache_key & k, cudnnHandle_t handle, 
             .set_diagonal_band_right_bound(0);
     }
 
-    // Diagnostic: temporarily skip bias to check if attention math works without mask.
-    if (false && has_bias_tensor) {
-        // ggml mask shape: [n_kv, n_q_padded_16, ...] F16; broadcast along heads.
-        // cuDNN attn_bias expected: {B, H, S_q, S_kv} but supports broadcast (1 in dims).
+    if (has_bias_tensor) {
+        // ggml mask: F16, dim [S_kv, S_q_padded, 1, 1], stride nb1=S_kv*sizeof(half).
+        // Broadcast across B and H by setting their strides to 0; for S_q dimension
+        // the stride is the row size of the ggml mask in HALF elements.
+        // cuDNN dim order is {B, H, S_q, S_kv}.
         auto bias = graph->tensor(fe::graph::Tensor_attributes()
                                       .set_name("bias").set_uid(UID_BIAS)
                                       .set_dim({1, 1, k.S_q, k.S_kv})
-                                      .set_stride({k.S_q * k.S_kv, k.S_q * k.S_kv, k.S_kv, 1})
+                                      .set_stride({0, 0, k.S_kv, 1})
                                       .set_data_type(fe::DataType_t::HALF));
         opts.set_bias(bias);
     }
@@ -349,14 +351,24 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
     fa_graph_entry * entry = nullptr;
     cudnnHandle_t handle = ctx.cudnn_handle(ctx.device);
     IK_CUDNN_CHECK(cudnnSetStream(handle, stream));
+    static const bool no_cache = []{
+        const char * s = std::getenv("IK_LLAMA_FA_NO_CACHE");
+        return s && std::strcmp(s, "0") != 0;
+    }();
+    fa_graph_entry built_local;
     {
         std::lock_guard<std::mutex> lock(g_fa_cache_mu);
-        auto it = g_fa_cache.find(key);
-        if (it == g_fa_cache.end()) {
-            fa_graph_entry built = build_graph(key, handle, key.has_mask != 0);
-            it = g_fa_cache.emplace(key, std::move(built)).first;
+        if (no_cache) {
+            built_local = build_graph(key, handle, key.has_mask != 0);
+            entry = &built_local;
+        } else {
+            auto it = g_fa_cache.find(key);
+            if (it == g_fa_cache.end()) {
+                fa_graph_entry built = build_graph(key, handle, key.has_mask != 0);
+                it = g_fa_cache.emplace(key, std::move(built)).first;
+            }
+            entry = &it->second;
         }
-        entry = &it->second;
     }
 
     // Workspace.
@@ -404,8 +416,7 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         {UID_V, V->data},
         {UID_O, o_f16.ptr},
     };
-    // Diagnostic: skip mask in variant_pack since we don't use it in graph.
-    // if (mask) { variant_pack[UID_BIAS] = mask->data; }
+    if (mask) { variant_pack[UID_BIAS] = mask->data; }
 
     {
         static int debug_n = 0;
@@ -430,27 +441,69 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         GGML_ABORT("cuDNN graph execute failed");
     }
 
-    // Cast HALF dense BHSD output → F32 ggml dst (which may be a permuted/non-dense view).
-    // We need a stride-aware copy. For now: use cudaMemcpy3D-style copy via simple
-    // kernel hand-rolled. To keep this incremental, do strided per-(h,s) memcpy.
+    // Cast HALF dense BHSD output → F32 ggml dst layout.
+    // CRITICAL: legacy mma_f16 writes to dst LINEARLY DENSE (`dst + jt*mmq_x*ne0`),
+    // ignoring dst->nb[2..3] padding. The downstream `ggml_view_2d/reshape_2d` over
+    // FA output expects D and H to be CONTIGUOUSLY PACKED in the first ne[0]*ne[1]*ne[2]*ne[3]
+    // F32 elements, NOT scattered at nb-strided offsets. So we cast HALF→F32 in
+    // dense [B, H, S, D] linear memory order starting at dst->data.
     {
-        const int64_t B = key.B, H = key.H_q, S = key.S_q, D = key.D_v;
-        const size_t dst_es = ggml_type_size(dst->type);  // 4 (F32)
-        const half * src = o_f16.ptr;
-        for (int64_t b = 0; b < B; ++b) {
-            for (int64_t h = 0; h < H; ++h) {
-                for (int64_t s = 0; s < S; ++s) {
-                    const int64_t src_off_elem = ((b*H + h)*S + s)*D;  // BHSD packed, in halfs
-                    const size_t dst_off_byte =
-                        (size_t)b*dst->nb[3] + (size_t)h*dst->nb[2] + (size_t)s*dst->nb[1];
-                    // Convert D halfs → D floats and write to dst at offset.
-                    // Use cudaMemcpyAsync of D halfs into a temp, then cast? Or kernel.
-                    // Simpler: launch a small cast kernel via existing primitives.
-                    // For now use a host-side helper that wraps a cast kernel:
-                    launch_half_to_float(src + src_off_elem,
-                        (float*)((char*)dst->data + dst_off_byte), (int)D, stream);
+        const int64_t total = key.B * key.H_q * key.S_q * key.D_v;
+        launch_half_to_float(o_f16.ptr, (float*)dst->data, (int)total, stream);
+    }
+
+    // ---- Diagnostic tensor dump on first call ----
+    {
+        static int dump_n = 0;
+        if (dump_n++ < 200) {
+            cudaStreamSynchronize(stream);
+            fprintf(stderr, "[fa-cudnn-dump] CALL %d: ", dump_n - 1);
+            auto dump_half = [&](const char * name, const void * dptr, int n) {
+                if (!dptr) { fprintf(stderr, "[fa-cudnn-dump] %s: null\n", name); return; }
+                std::vector<uint16_t> h(n);
+                cudaMemcpy(h.data(), dptr, n*2, cudaMemcpyDeviceToHost);
+                fprintf(stderr, "[fa-cudnn-dump] %s (HALF):", name);
+                for (int i=0;i<n;++i) {
+                    half hv; std::memcpy(&hv, &h[i], 2);
+                    fprintf(stderr, " %.4e", (double)__half2float(hv));
                 }
-            }
+                fprintf(stderr, "\n");
+            };
+            auto dump_f32 = [&](const char * name, const void * dptr, int n) {
+                if (!dptr) { fprintf(stderr, "[fa-cudnn-dump] %s: null\n", name); return; }
+                std::vector<float> h(n);
+                cudaMemcpy(h.data(), dptr, n*4, cudaMemcpyDeviceToHost);
+                fprintf(stderr, "[fa-cudnn-dump] %s (F32):", name);
+                for (int i=0;i<n;++i) fprintf(stderr, " %.4e", (double)h[i]);
+                fprintf(stderr, "\n");
+            };
+            const int N = 4;
+            const int64_t D = key.D_v;
+            const int64_t H = key.H_q;
+            // Compact one-line hash dump : Q_h0[0..3] + dst_h0[0..3]
+            std::vector<uint16_t> qh(N);
+            cudaMemcpy(qh.data(), q_data, N*2, cudaMemcpyDeviceToHost);
+            fprintf(stderr, "Q_h0=");
+            for (int i=0;i<N;++i) { half hv; std::memcpy(&hv,&qh[i],2); fprintf(stderr, "%+.4e,", (double)__half2float(hv)); }
+            std::vector<float> dh(N);
+            cudaMemcpy(dh.data(), dst->data, N*4, cudaMemcpyDeviceToHost);
+            fprintf(stderr, " dst_h0=");
+            for (int i=0;i<N;++i) fprintf(stderr, "%+.4e,", (double)dh[i]);
+            fprintf(stderr, " S_kv=%lld\n", (long long)key.S_kv);
+            fflush(stderr);
+            return;  // skip the verbose dumps below
+            // Output HALF pool — dump head 0, 1, 5, 11 (BHSD packed; head h at offset h*S*D = h*D for S=1)
+            dump_half("O_h0", o_f16.ptr, N);
+            dump_half("O_h1", o_f16.ptr + 1*D, N);
+            dump_half("O_h5", o_f16.ptr + 5*D, N);
+            dump_half("O_h11", o_f16.ptr + 11*D, N);
+            // dst F32 — head h at byte offset h*nb[2]; in F32 elements: h*nb[2]/4
+            const size_t dst_h_stride_f32 = dst->nb[2] / 4;
+            dump_f32("dst_h0", dst->data, N);
+            dump_f32("dst_h1", (float*)dst->data + 1*dst_h_stride_f32, N);
+            dump_f32("dst_h5", (float*)dst->data + 5*dst_h_stride_f32, N);
+            dump_f32("dst_h11", (float*)dst->data + 11*dst_h_stride_f32, N);
+            fflush(stderr);
         }
     }
 

@@ -143,3 +143,6 @@ poetry.toml
 # IDE
 *.code-workspace
 .windsurf/
+
+# cuDNN frontend (vendored, MIT)
+ggml/src/ggml-cuda/external/cudnn-frontend/
