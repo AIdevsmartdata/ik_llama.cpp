@@ -12,7 +12,10 @@
 #include "fattn-wmma-f16-interface.cuh"
 #include "fattn-mma-f16-interface.cuh"
 #include "fattn-new-mma.cuh"
+#include "fattn-cudnn.cuh"
 #include "fattn.cuh"
+#include <cstring>
+#include <cstdlib>
 #include "convert.cuh"
 
 #include <cstdint>
@@ -34,6 +37,34 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int32_t precision = KQV->op_params[3];
     const int32_t n_swa = KQV->op_params[4];
+
+    // 2026-04-26: cuDNN SDPA path. Activated by env IK_LLAMA_FA_BACKEND=cudnn.
+    // Fixes Blackwell sm_120 multi-seq M>=3 illegal-memory-access bug in legacy
+    // mma_f16 / wmma_f16 / tile_f16 kernels (root cause: launch_fattn dequant
+    // treats K/V as 1D contiguous, ignoring strides for non-contig views).
+    {
+        static const bool fa_use_cudnn = []{
+            const char * s = std::getenv("IK_LLAMA_FA_BACKEND");
+            bool v = s && std::strcmp(s, "cudnn") == 0;
+            fprintf(stderr, "[fa-cudnn-dispatch] IK_LLAMA_FA_BACKEND='%s' fa_use_cudnn=%d\n", s ? s : "(null)", (int)v);
+            return v;
+        }();
+        if (fa_use_cudnn) {
+            bool sup = ggml_cuda_fattn_cudnn_is_supported(ctx, dst);
+            static int log_n = 0;
+            if (log_n++ < 5) {
+                fprintf(stderr, "[fa-cudnn-dispatch] is_supported=%d  Q={%lld,%lld,%lld,%lld} K={%lld,%lld,%lld,%lld} K->type=%d V->type=%d head_dim=%lld n_swa=%d\n",
+                    (int)sup,
+                    (long long)Q->ne[0], (long long)Q->ne[1], (long long)Q->ne[2], (long long)Q->ne[3],
+                    (long long)K->ne[0], (long long)K->ne[1], (long long)K->ne[2], (long long)K->ne[3],
+                    (int)K->type, (int)V->type, (long long)Q->ne[0], (int)n_swa);
+            }
+            if (sup) {
+                ggml_cuda_flash_attn_ext_cudnn(ctx, dst);
+                return;
+            }
+        }
+    }
 
     ggml_tensor local_dst, Kl, Vl, Ml;
     if (n_swa > 0) {
@@ -136,6 +167,29 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (!new_mma_available(cc) || K->ne[0] != V->ne[0]) {
         ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
         return;
+    }
+
+    // Diagnostic 2026-04-26: runtime kernel selector for FA dispatch on sm_120.
+    // mma_f16 has a confirmed multi-seq batched bug on RTX 5060 Ti (sm_120) that crashes
+    // with "illegal memory access" when Q->ne[1] >= 3 and prompts are heterogeneous.
+    // Env vars allow forcing alternative kernels for testing/workaround:
+    //   IK_LLAMA_FA_FORCE=wmma | tile | vec | mma  (default = mma, the current behavior)
+    {
+        static const char * fa_force = std::getenv("IK_LLAMA_FA_FORCE");
+        if (fa_force) {
+            if (!strcmp(fa_force, "wmma")) { ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst); return; }
+            if (!strcmp(fa_force, "tile")) {
+                if (precision == GGML_PREC_DEFAULT) ggml_cuda_flash_attn_ext_tile_f16(ctx, dst);
+                else                                ggml_cuda_flash_attn_ext_tile_f32(ctx, dst);
+                return;
+            }
+            if (!strcmp(fa_force, "vec"))  {
+                if (precision == GGML_PREC_DEFAULT) ggml_cuda_flash_attn_ext_vec_f16(ctx, dst);
+                else                                ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
+                return;
+            }
+            // "mma" → fall through to default
+        }
     }
 
     // As mentioned above, the new-new MMA is slower then the new MMA.

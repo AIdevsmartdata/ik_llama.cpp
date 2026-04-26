@@ -551,6 +551,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
         }
+#ifdef GGML_USE_CUDNN
+        if (cudnn_handles[i] != nullptr) {
+            cudnnDestroy(cudnn_handles[i]);
+            cudnn_handles[i] = nullptr;
+        }
+#endif
     }
     auto info = const_cast<ggml_cuda_device_info*>(&ggml_cuda_info());
     if (info->all_ctx[device] == this) {
@@ -2272,6 +2278,15 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
         quantized_size += get_mmq_x_max_host(ggml_cuda_info().devices[ctx.device].cc)*sizeof(block_q8_1_mmq);
     }
     ggml_cuda_pool_alloc<char> src1_quantized(ctx.pool(), quantized_size);
+    // Fix 2026-04-26 morning: zero src1_quantized before quantize. compute-sanitizer initcheck
+    // on the M>=3 multi-seq crash flagged uninit reads at mmq.cuh:3902 (tile_y[l] = by0[l]).
+    // mul_mat_q tile loop reads up to mmq_x columns even when tile_y_max_j masks them
+    // downstream — those reads land on LIFO pool tail positions that quantize never wrote,
+    // and on multi-seq hetero workloads the pool slab can contain unmapped pages → driver
+    // surfaces "illegal memory access". Zeroing makes the uninit read defined (zero contrib
+    // to dot, masked anyway by tile_y_max_j). Cost: ~quantized_size memset per matmul, but
+    // quantized_size << activations, and CUDA memset is async on the matmul stream.
+    CUDA_CHECK(cudaMemsetAsync(src1_quantized.get(), 0, quantized_size, stream));
     if (is_gemv) {
         const float * src1_src = (const float *)src1->data;
         // TurboQuant TQ3: apply forward WHT rotation on activations before q8_1

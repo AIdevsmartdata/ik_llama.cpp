@@ -380,6 +380,66 @@ if (GGML_CUDA)
 
         list(APPEND GGML_CDEF_PUBLIC GGML_USE_CUDA)
 
+        # cuDNN-backed flash attention path (2026-04-26).
+        # Fixes Blackwell sm_120 multi-seq M>=3 illegal-memory-access in the
+        # legacy ggml mma_f16 kernel. Activated at runtime by IK_LLAMA_FA_BACKEND=cudnn.
+        option(GGML_CUDNN "ggml: use cuDNN for flash attention" ON)
+        if (GGML_CUDNN)
+            find_path(CUDNN_INCLUDE_DIR cudnn_version.h
+                HINTS ${CUDAToolkit_INCLUDE_DIR}
+                      /usr/include/x86_64-linux-gnu
+                      /usr/include
+                      /usr/local/cuda/include)
+            find_library(CUDNN_LIBRARY cudnn
+                HINTS ${CUDAToolkit_LIBRARY_DIR}
+                      /usr/lib/x86_64-linux-gnu
+                      /usr/local/cuda/lib64)
+            if (CUDNN_INCLUDE_DIR AND CUDNN_LIBRARY)
+                file(READ "${CUDNN_INCLUDE_DIR}/cudnn_version.h" _cudnn_v)
+                string(REGEX MATCH "CUDNN_MAJOR ([0-9]+)" _ "${_cudnn_v}")
+                set(CUDNN_MAJOR "${CMAKE_MATCH_1}")
+                string(REGEX MATCH "CUDNN_MINOR ([0-9]+)" _ "${_cudnn_v}")
+                set(CUDNN_MINOR "${CMAKE_MATCH_1}")
+                if (CUDNN_MAJOR GREATER_EQUAL 9 AND CUDNN_MINOR GREATER_EQUAL 7)
+                    message(STATUS "cuDNN ${CUDNN_MAJOR}.${CUDNN_MINOR} enabled (${CUDNN_LIBRARY})")
+                    list(APPEND GGML_CDEF_PUBLIC GGML_USE_CUDNN)
+                    # Vendored cudnn-frontend (header-only)
+                    set(CUDNN_FRONTEND_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ggml-cuda/external/cudnn-frontend/include)
+                    if (EXISTS ${CUDNN_FRONTEND_DIR}/cudnn_frontend.h)
+                        include_directories(${CUDNN_FRONTEND_DIR})
+                    else()
+                        message(WARNING "cudnn-frontend not vendored at ${CUDNN_FRONTEND_DIR}; cuDNN backend will FAIL TO COMPILE.")
+                    endif()
+                    include_directories(${CUDNN_INCLUDE_DIR})
+                    set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} ${CUDNN_LIBRARY})
+                    # cuDNN runtime-compilation depends on nvrtc + cuda driver API
+                    find_library(CUDA_NVRTC_LIB nvrtc HINTS ${CUDAToolkit_LIBRARY_DIR} /usr/local/cuda/lib64)
+                    find_library(CUDA_DRV_LIB cuda HINTS ${CUDAToolkit_LIBRARY_DIR} /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu)
+                    if (CUDA_NVRTC_LIB)
+                        set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} ${CUDA_NVRTC_LIB})
+                    endif()
+                    if (CUDA_DRV_LIB)
+                        set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} ${CUDA_DRV_LIB})
+                    endif()
+                    # cuDNN needs cudart 12.4+ symbols. Force linker to use the
+                    # CUDA 12.8 toolkit cudart, not the older system /usr/lib one.
+                    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L${CUDAToolkit_LIBRARY_DIR} -Wl,-rpath,${CUDAToolkit_LIBRARY_DIR} -Wl,-rpath-link,${CUDAToolkit_LIBRARY_DIR}")
+                    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -L${CUDAToolkit_LIBRARY_DIR} -Wl,-rpath,${CUDAToolkit_LIBRARY_DIR} -Wl,-rpath-link,${CUDAToolkit_LIBRARY_DIR}")
+                    # Explicitly prepend cudart from CUDA 12.8 toolkit (must precede
+                    # transitive cudart from cublas/cudnn).
+                    find_library(CUDA_RT_NEW cudart HINTS ${CUDAToolkit_LIBRARY_DIR} NO_DEFAULT_PATH)
+                    if (CUDA_RT_NEW)
+                        set(GGML_EXTRA_LIBS ${CUDA_RT_NEW} ${GGML_EXTRA_LIBS})
+                    endif()
+                    link_directories(BEFORE ${CUDAToolkit_LIBRARY_DIR})
+                else()
+                    message(STATUS "cuDNN ${CUDNN_MAJOR}.${CUDNN_MINOR} < 9.7; disabling GGML_CUDNN")
+                endif()
+            else()
+                message(STATUS "cuDNN headers/library not found; disabling GGML_CUDNN")
+            endif()
+        endif()
+
         add_compile_definitions(GGML_CUDA_DMMV_X=${GGML_CUDA_DMMV_X})
         add_compile_definitions(GGML_CUDA_MMV_Y=${GGML_CUDA_MMV_Y})
         add_compile_definitions(K_QUANTS_PER_ITERATION=${GGML_CUDA_KQUANTS_ITER})

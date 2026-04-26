@@ -863,6 +863,9 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+#ifdef GGML_USE_CUDNN
+    cudnnHandle_t  cudnn_handles[GGML_CUDA_MAX_DEVICES]  = {nullptr};
+#endif
 
     int   fusion = GGML_CUDA_FUSION;
     int   offload_batch_size = GGML_CUDA_MIN_BATCH_OFFLOAD;
@@ -908,6 +911,21 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handle() {
         return cublas_handle(device);
     }
+
+#ifdef GGML_USE_CUDNN
+    cudnnHandle_t cudnn_handle(int device) {
+        if (cudnn_handles[device] == nullptr) {
+            ggml_cuda_set_device(device);
+            cudnnStatus_t s = cudnnCreate(&cudnn_handles[device]);
+            if (s != CUDNN_STATUS_SUCCESS) {
+                fprintf(stderr, "cudnnCreate failed: %d\n", (int)s);
+                cudnn_handles[device] = nullptr;
+            }
+        }
+        return cudnn_handles[device];
+    }
+    cudnnHandle_t cudnn_handle() { return cudnn_handle(device); }
+#endif
 
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES];
