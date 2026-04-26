@@ -48,6 +48,44 @@ static inline void launch_half_to_float(const half * src, float * dst, int n, cu
     k_half_to_float_d<<<grid, block, 0, s>>>(src, dst, n);
 }
 
+// Stride-aware Q F32 → HALF dense BHSD cast.
+// Reads Q via ggml ne[]/nb[] (handles any permutation, including the typical
+// `ggml_permute(0, 2, 1, 3)` that produces ne=[D, S, H, B] with non-contiguous nb).
+// Writes contiguous BHSD = [B, H, S, D] cuDNN-canonical layout.
+static __global__ void k_cast_q_to_dense_bhsd(
+        const float * __restrict__ src,
+        half        * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const int64_t nb0, const int64_t nb1, const int64_t nb2, const int64_t nb3,
+        const int64_t H, const int64_t S, const int64_t D) {
+    const int64_t total = ne3 * ne2 * ne1 * ne0;
+    const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int64_t i = idx;
+    const int64_t d = i % ne0; i /= ne0;
+    const int64_t s = i % ne1; i /= ne1;
+    const int64_t h = i % ne2;
+    const int64_t b = i / ne2;
+    const char * p = (const char*)src + b*nb3 + h*nb2 + s*nb1 + d*nb0;
+    const float v = *(const float*)p;
+    const int64_t out_idx = ((b * H + h) * S + s) * D + d;
+    dst[out_idx] = __float2half(v);
+}
+
+static inline void launch_cast_q_strided(
+        const ggml_tensor * Q, half * q_f16,
+        int64_t H, int64_t S, int64_t D, cudaStream_t stream) {
+    const int64_t total = Q->ne[0] * Q->ne[1] * Q->ne[2] * Q->ne[3];
+    if (total <= 0) return;
+    const int block = 256;
+    const int grid  = (int)((total + block - 1) / block);
+    k_cast_q_to_dense_bhsd<<<grid, block, 0, stream>>>(
+        (const float*)Q->data, q_f16,
+        Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
+        Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3],
+        H, S, D);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -258,7 +296,7 @@ static fa_graph_entry build_graph(const fa_cache_key & k, cudnnHandle_t handle, 
     // Output: ggml dst has shape [D_v, S_q, H_q, 1]. cuDNN computes
     // [B, H_q, S_q, D_v]. Match the strides so cuDNN writes directly into
     // ggml's destination memory with no extra permute.
-    // Output: HALF in dense BHSD packing (we manually cast to F32 → ggml dst after).
+    // Output: HALF dense BHSD packed (we cast HALF→F32 → ggml dst after).
     O->set_output(true).set_uid(UID_O)
      .set_dim({k.B, k.H_q, k.S_q, k.D_v})
      .set_stride({k.H_q * k.S_q * k.D_v, k.S_q * k.D_v, k.D_v, 1})
@@ -389,27 +427,17 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
     if (Q->type == GGML_TYPE_F32) {
         const int64_t q_nelem = ggml_nelements(Q);
         q_f16.alloc(q_nelem);
-        // ggml_get_to_fp16_cuda handles type conversion; for F32→F16 it's a
-        // simple cast, treating source as 1D linear.
-        // **Critical**: Q here is a permuted view with non-trivial strides.
-        // Use cudaMemcpy2DAsync for stride-aware copy then cast, OR use
-        // existing cpy primitive. For decode S_q=1 the layout is effectively
-        // packed [D, H_q] so direct 1D cast still works (S has stride > 0
-        // but only one slice). For prefill S_q>1 we'd need stride-aware.
-        to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
-        if (!to_fp16) GGML_ABORT("no F32->F16 converter");
-        to_fp16((const float *)Q->data, q_f16.ptr, 1, q_nelem, stream);
+        // Stride-aware F32→HALF cast. Respects ggml's ne[]/nb[] (any permutation),
+        // writes dense BHSD layout matching what cuDNN's q_stride expects.
+        launch_cast_q_strided(Q, q_f16.ptr, key.H_q, key.S_q, key.D_qk, stream);
         q_data = q_f16.ptr;
-        // Q strides remain in element units of HALF (was F32). Halve them.
-        // Actually we recompute below since q_stride was element-relative to F32.
     }
 
-    // Allocate intermediate HALF output buffer (cuDNN writes to it; we cast to F32 dst).
+    // HALF intermediate buffer; cast back to F32 dst after execute.
     const int64_t out_nelem = key.B * key.H_q * key.S_q * key.D_v;
     ggml_cuda_pool_alloc<half> o_f16(ctx.pool());
     o_f16.alloc(out_nelem);
 
-    // Variant pack: device pointers per UID.
     std::unordered_map<int64_t, void *> variant_pack = {
         {UID_Q, q_data},
         {UID_K, K->data},
@@ -441,12 +469,8 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         GGML_ABORT("cuDNN graph execute failed");
     }
 
-    // Cast HALF dense BHSD output → F32 ggml dst layout.
-    // CRITICAL: legacy mma_f16 writes to dst LINEARLY DENSE (`dst + jt*mmq_x*ne0`),
-    // ignoring dst->nb[2..3] padding. The downstream `ggml_view_2d/reshape_2d` over
-    // FA output expects D and H to be CONTIGUOUSLY PACKED in the first ne[0]*ne[1]*ne[2]*ne[3]
-    // F32 elements, NOT scattered at nb-strided offsets. So we cast HALF→F32 in
-    // dense [B, H, S, D] linear memory order starting at dst->data.
+    // Cast HALF dense BHSD output → F32 dst (linear dense, ignoring nb-padding,
+    // matches what legacy mma_f16 does).
     {
         const int64_t total = key.B * key.H_q * key.S_q * key.D_v;
         launch_half_to_float(o_f16.ptr, (float*)dst->data, (int)total, stream);
@@ -490,19 +514,6 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
             fprintf(stderr, " dst_h0=");
             for (int i=0;i<N;++i) fprintf(stderr, "%+.4e,", (double)dh[i]);
             fprintf(stderr, " S_kv=%lld\n", (long long)key.S_kv);
-            fflush(stderr);
-            return;  // skip the verbose dumps below
-            // Output HALF pool — dump head 0, 1, 5, 11 (BHSD packed; head h at offset h*S*D = h*D for S=1)
-            dump_half("O_h0", o_f16.ptr, N);
-            dump_half("O_h1", o_f16.ptr + 1*D, N);
-            dump_half("O_h5", o_f16.ptr + 5*D, N);
-            dump_half("O_h11", o_f16.ptr + 11*D, N);
-            // dst F32 — head h at byte offset h*nb[2]; in F32 elements: h*nb[2]/4
-            const size_t dst_h_stride_f32 = dst->nb[2] / 4;
-            dump_f32("dst_h0", dst->data, N);
-            dump_f32("dst_h1", (float*)dst->data + 1*dst_h_stride_f32, N);
-            dump_f32("dst_h5", (float*)dst->data + 5*dst_h_stride_f32, N);
-            dump_f32("dst_h11", (float*)dst->data + 11*dst_h_stride_f32, N);
             fflush(stderr);
         }
     }
