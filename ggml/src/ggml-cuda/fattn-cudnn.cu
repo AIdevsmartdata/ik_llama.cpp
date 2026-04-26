@@ -107,6 +107,27 @@ static __global__ void k_copy_kv_to_dense_bhsd(
     dst[out_idx] = v;
 }
 
+// Stride-aware F16 → BF16 copy for K/V (P9: BF16 attempt to avoid FP16 softmax saturation).
+static __global__ void k_copy_kv_f16_to_dense_bf16_bhsd(
+        const half * __restrict__ src,
+        __nv_bfloat16 * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const int64_t nb0, const int64_t nb1, const int64_t nb2, const int64_t nb3,
+        const int64_t H, const int64_t S, const int64_t D) {
+    const int64_t total = ne3 * ne2 * ne1 * ne0;
+    const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int64_t i = idx;
+    const int64_t d = i % ne0; i /= ne0;
+    const int64_t s = i % ne1; i /= ne1;
+    const int64_t h = i % ne2;
+    const int64_t b = i / ne2;
+    const char * p = (const char*)src + b*nb3 + h*nb2 + s*nb1 + d*nb0;
+    const float v = __half2float(*(const half*)p);
+    const int64_t out_idx = ((b * H + h) * S + s) * D + d;
+    dst[out_idx] = __float2bfloat16(v);
+}
+
 static inline void launch_copy_kv_strided(
         const ggml_tensor * T, half * dense,
         int64_t H, int64_t S, int64_t D, cudaStream_t stream) {
@@ -119,6 +140,67 @@ static inline void launch_copy_kv_strided(
         T->ne[0], T->ne[1], T->ne[2], T->ne[3],
         T->nb[0], T->nb[1], T->nb[2], T->nb[3],
         H, S, D);
+}
+
+static inline void launch_copy_kv_strided_bf16(
+        const ggml_tensor * T, __nv_bfloat16 * dense,
+        int64_t H, int64_t S, int64_t D, cudaStream_t stream) {
+    const int64_t total = T->ne[0] * T->ne[1] * T->ne[2] * T->ne[3];
+    if (total <= 0) return;
+    const int block = 256;
+    const int grid  = (int)((total + block - 1) / block);
+    k_copy_kv_f16_to_dense_bf16_bhsd<<<grid, block, 0, stream>>>(
+        (const half*)T->data, dense,
+        T->ne[0], T->ne[1], T->ne[2], T->ne[3],
+        T->nb[0], T->nb[1], T->nb[2], T->nb[3],
+        H, S, D);
+}
+
+// Q F32 → BF16 cast (variant of k_cast_q_to_dense_bhsd).
+static __global__ void k_cast_q_to_dense_bf16_bhsd(
+        const float * __restrict__ src,
+        __nv_bfloat16 * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const int64_t nb0, const int64_t nb1, const int64_t nb2, const int64_t nb3,
+        const int64_t H, const int64_t S, const int64_t D) {
+    const int64_t total = ne3 * ne2 * ne1 * ne0;
+    const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int64_t i = idx;
+    const int64_t d = i % ne0; i /= ne0;
+    const int64_t s = i % ne1; i /= ne1;
+    const int64_t h = i % ne2;
+    const int64_t b = i / ne2;
+    const char * p = (const char*)src + b*nb3 + h*nb2 + s*nb1 + d*nb0;
+    const float v = *(const float*)p;
+    const int64_t out_idx = ((b * H + h) * S + s) * D + d;
+    dst[out_idx] = __float2bfloat16(v);
+}
+
+static inline void launch_cast_q_strided_bf16(
+        const ggml_tensor * Q, __nv_bfloat16 * q_bf16,
+        int64_t H, int64_t S, int64_t D, cudaStream_t stream) {
+    const int64_t total = Q->ne[0] * Q->ne[1] * Q->ne[2] * Q->ne[3];
+    if (total <= 0) return;
+    const int block = 256;
+    const int grid  = (int)((total + block - 1) / block);
+    k_cast_q_to_dense_bf16_bhsd<<<grid, block, 0, stream>>>(
+        (const float*)Q->data, q_bf16,
+        Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
+        Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3],
+        H, S, D);
+}
+
+// BF16 → F32 cast for output
+static __global__ void k_bf16_to_float(const __nv_bfloat16 * __restrict__ src, float * __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __bfloat162float(src[i]);
+}
+static inline void launch_bf16_to_float(const __nv_bfloat16 * src, float * dst, int n, cudaStream_t s) {
+    if (n <= 0) return;
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    k_bf16_to_float<<<grid, block, 0, s>>>(src, dst, n);
 }
 
 // ---------------------------------------------------------------------------
@@ -496,12 +578,18 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
     // arithmetic.
     ggml_cuda_pool_alloc<half> q_f16(ctx.pool());
     void * q_data = Q->data;
+    static const bool fa_use_bf16 = []{
+        const char * s = std::getenv("IK_LLAMA_FA_BF16");
+        return s && std::strcmp(s, "0") != 0;
+    }();
     if (Q->type == GGML_TYPE_F32) {
         const int64_t q_nelem = ggml_nelements(Q);
         q_f16.alloc(q_nelem);
-        // Stride-aware F32→HALF cast. Respects ggml's ne[]/nb[] (any permutation),
-        // writes dense BHSD layout matching what cuDNN's q_stride expects.
-        launch_cast_q_strided(Q, q_f16.ptr, key.H_q, key.S_q, key.D_qk, stream);
+        if (fa_use_bf16) {
+            launch_cast_q_strided_bf16(Q, (__nv_bfloat16*)q_f16.ptr, key.H_q, key.S_q, key.D_qk, stream);
+        } else {
+            launch_cast_q_strided(Q, q_f16.ptr, key.H_q, key.S_q, key.D_qk, stream);
+        }
         q_data = q_f16.ptr;
     }
 
@@ -518,12 +606,14 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
     void * v_data = V->data;
     if (!no_kv_dense && !ggml_is_contiguous(K)) {
         K_dense.alloc(key.B * key.H_k * key.S_kv * key.D_qk);
-        launch_copy_kv_strided(K, K_dense.ptr, key.H_k, key.S_kv, key.D_qk, stream);
+        if (fa_use_bf16) launch_copy_kv_strided_bf16(K, (__nv_bfloat16*)K_dense.ptr, key.H_k, key.S_kv, key.D_qk, stream);
+        else          launch_copy_kv_strided(K, K_dense.ptr, key.H_k, key.S_kv, key.D_qk, stream);
         k_data = K_dense.ptr;
     }
     if (!no_kv_dense && !ggml_is_contiguous(V)) {
         V_dense.alloc(key.B * key.H_k * key.S_kv * key.D_v);
-        launch_copy_kv_strided(V, V_dense.ptr, key.H_k, key.S_kv, key.D_v, stream);
+        if (fa_use_bf16) launch_copy_kv_strided_bf16(V, (__nv_bfloat16*)V_dense.ptr, key.H_k, key.S_kv, key.D_v, stream);
+        else          launch_copy_kv_strided(V, V_dense.ptr, key.H_k, key.S_kv, key.D_v, stream);
         v_data = V_dense.ptr;
     }
 
@@ -567,11 +657,14 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         GGML_ABORT("cuDNN graph execute failed");
     }
 
-    // Cast HALF dense BHSD output → F32 dst (linear dense, ignoring nb-padding,
-    // matches what legacy mma_f16 does).
+    // Cast HALF/BF16 dense BHSD output → F32 dst (linear dense).
     {
         const int64_t total = key.B * key.H_q * key.S_q * key.D_v;
-        launch_half_to_float(o_f16.ptr, (float*)dst->data, (int)total, stream);
+        if (fa_use_bf16) {
+            launch_bf16_to_float((const __nv_bfloat16*)o_f16.ptr, (float*)dst->data, (int)total, stream);
+        } else {
+            launch_half_to_float(o_f16.ptr, (float*)dst->data, (int)total, stream);
+        }
     }
 
     // ---- Diagnostic tensor dump on first call ----
