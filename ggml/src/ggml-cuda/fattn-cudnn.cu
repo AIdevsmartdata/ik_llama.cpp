@@ -273,8 +273,17 @@ static fa_graph_entry build_graph(const fa_cache_key & k, cudnnHandle_t handle, 
     // (Source of truth at execute time still verified via op_params[0] in entry().)
     opts.set_attn_scale(1.0f / std::sqrt(float(k.D_qk)));
 
-    if (k.causal) {
-        opts.set_diagonal_alignment(fe::DiagonalAlignment_t::TOP_LEFT)
+    static const bool use_causal_env = []{
+        const char * s = std::getenv("IK_LLAMA_FA_CAUSAL");
+        return s && std::strcmp(s, "0") != 0;
+    }();
+    if (use_causal_env || k.causal) {
+        // BOTTOM_RIGHT for decode (S_q < S_kv): diagonal anchored on current
+        // token. TOP_LEFT only for prefill (S_q == S_kv).
+        auto align = (k.S_q == k.S_kv)
+            ? fe::DiagonalAlignment_t::TOP_LEFT
+            : fe::DiagonalAlignment_t::BOTTOM_RIGHT;
+        opts.set_diagonal_alignment(align)
             .set_diagonal_band_right_bound(0);
     }
 
